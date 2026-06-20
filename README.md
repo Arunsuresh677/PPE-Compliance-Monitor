@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://img.shields.io/badge/STATUS-LIVE%20IN%20PRODUCTION-brightgreen?style=for-the-badge&logo=streamlit" />
+<img src="https://img.shields.io/badge/STATUS-LIVE%20ON%20STREAMLIT%20CLOUD-brightgreen?style=for-the-badge&logo=streamlit" />
 
 # PPE Compliance Monitor
 
@@ -281,7 +281,7 @@ CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0"]
 
 ## Training
 
-The model was trained on a public PPE/helmet detection dataset using **Google Colab (T4 GPU)**.
+The model was trained on **~5,000 images** spanning varied industrial lighting and environments using **Google Colab (T4 GPU)**.
 
 ### Data format (YOLO)
 

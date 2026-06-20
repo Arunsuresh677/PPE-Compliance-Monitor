@@ -25,6 +25,7 @@ from ultralytics import YOLO
 
 from src.database.repository import ViolationRepository
 from src.tracking.violation_tracker import ViolationTracker, VIOLATION_CLASSES
+from src.detection.draw import draw_detections
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,19 +33,6 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
-
-CLASS_COLORS = {
-    "hardhat"       : (0, 200, 0),
-    "mask"          : (0, 180, 0),
-    "safety vest"   : (0, 160, 0),
-    "no-hardhat"    : (0, 0, 220),
-    "no-mask"       : (0, 0, 200),
-    "no-safety vest": (0, 0, 180),
-    "person"        : (200, 200, 0),
-    "safety cone"   : (0, 165, 255),
-    "machinery"     : (180, 100, 0),
-    "vehicle"       : (150, 80, 0),
-}
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
@@ -69,62 +57,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-track", action="store_true",            help="Disable ByteTrack (use plain detection)")
     parser.add_argument("--db",       type=str,   default="ppe_violations.db", help="SQLite DB path")
     return parser.parse_args()
-
-
-def draw_detections(frame, results, conf_threshold: float) -> tuple:
-    """
-    Annotate frame with bounding boxes, track IDs, labels, and status banner.
-
-    Returns (annotated_frame, detections) where detections is a list of
-    (track_id_or_None, class_name) for every box drawn.
-    """
-    detections: list[tuple] = []
-
-    for result in results:
-        boxes = result.boxes
-        if boxes is None:
-            continue
-
-        track_ids = (
-            boxes.id.int().tolist() if boxes.id is not None else [None] * len(boxes)
-        )
-
-        for box, track_id in zip(boxes, track_ids):
-            conf = float(box.conf[0])
-            if conf < conf_threshold:
-                continue
-
-            cls_id   = int(box.cls[0])
-            cls_name = result.names[cls_id]
-            cls_key  = cls_name.lower()
-            color    = CLASS_COLORS.get(cls_key, (200, 200, 200))
-
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # Label: show track ID when available
-            id_prefix = f"#{track_id} " if track_id is not None else ""
-            label = f"{id_prefix}{cls_name} {conf:.2f}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(frame, label, (x1 + 2, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-
-            detections.append((track_id, cls_name))
-
-    # Status banner
-    violations = [cls for _, cls in detections if cls in VIOLATION_CLASSES]
-    if violations:
-        unique = list(set(violations))
-        cv2.rectangle(frame, (0, 0), (frame.shape[1], 42), (0, 0, 180), -1)
-        cv2.putText(frame, f"VIOLATION: {', '.join(unique)}", (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-    else:
-        cv2.rectangle(frame, (0, 0), (frame.shape[1], 42), (0, 140, 0), -1)
-        cv2.putText(frame, "PPE COMPLIANT", (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-
-    return frame, detections
 
 
 def run(args: argparse.Namespace) -> None:
@@ -168,9 +100,7 @@ def run(args: argparse.Namespace) -> None:
         results = model.predict(
             source=frame, conf=args.conf, imgsz=args.imgsz, verbose=False
         )
-        frame, detections = draw_detections(frame, results, args.conf)
-
-        violations = [cls for _, cls in detections if cls in VIOLATION_CLASSES]
+        frame, _, violations, _, detections = draw_detections(frame, results, args.conf)
         if violations:
             log.warning("VIOLATION: %s", ", ".join(set(violations)))
         else:
@@ -237,7 +167,7 @@ def run(args: argparse.Namespace) -> None:
                     verbose=False,
                 )
 
-            frame, detections = draw_detections(frame, results, args.conf)
+            frame, _, _, _, detections = draw_detections(frame, results, args.conf)
 
             # ── Update tracker, persist closed events ──────────────────
             if tracker is not None:

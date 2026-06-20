@@ -142,23 +142,33 @@ class ViolationRepository:
 
     def get_session_summary(self, session: str) -> dict[str, Any]:
         with self._lock:
-            cur = self._conn.execute(
+            # Overall aggregates — no GROUP BY so COUNT(DISTINCT ...) spans all rows
+            overall_cur = self._conn.execute(
                 """
                 SELECT
-                    COUNT(*)                                        AS total_events,
-                    COUNT(DISTINCT track_id)                        AS distinct_violators,
-                    ROUND(SUM(COALESCE(duration_secs, 0)), 1)       AS total_violation_secs,
-                    violation_class,
-                    COUNT(*)                                        AS class_count
+                    COUNT(*)                                   AS total_events,
+                    COUNT(DISTINCT track_id)                   AS distinct_violators,
+                    ROUND(SUM(COALESCE(duration_secs, 0)), 1) AS total_violation_secs
+                FROM violation_events
+                WHERE session = ?
+                """,
+                (session,),
+            )
+            overall = overall_cur.fetchone()
+
+            # Per-class breakdown
+            class_cur = self._conn.execute(
+                """
+                SELECT violation_class, COUNT(*) AS class_count
                 FROM violation_events
                 WHERE session = ?
                 GROUP BY violation_class
                 """,
                 (session,),
             )
-            rows = cur.fetchall()
+            by_class = {r[0]: r[1] for r in class_cur.fetchall()}
 
-        if not rows:
+        if not overall or overall[0] == 0:
             return {
                 "total_events"        : 0,
                 "distinct_violators"  : 0,
@@ -166,15 +176,10 @@ class ViolationRepository:
                 "by_class"            : {},
             }
 
-        total_events = sum(r[4] for r in rows)
-        distinct     = rows[0][1]
-        total_secs   = sum(r[2] or 0 for r in rows)
-        by_class     = {r[3]: r[4] for r in rows}
-
         return {
-            "total_events"        : total_events,
-            "distinct_violators"  : distinct,
-            "total_violation_secs": round(total_secs, 1),
+            "total_events"        : overall[0],
+            "distinct_violators"  : overall[1],
+            "total_violation_secs": overall[2] or 0.0,
             "by_class"            : by_class,
         }
 

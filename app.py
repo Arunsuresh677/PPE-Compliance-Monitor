@@ -16,6 +16,7 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfigurati
 from src.database.repository import ViolationRepository
 from src.tracking.violation_tracker import ViolationTracker, VIOLATION_CLASSES, COMPLIANT_CLASSES
 from src.detection.model import load_model as _load_model_impl
+from src.detection.draw import CLASS_COLORS, draw_detections
 from src.config.settings import settings
 
 log = logging.getLogger(__name__)
@@ -103,19 +104,6 @@ MODEL_URL  = "https://huggingface.co/Arunsuresh677/ppe-compliance-monitor/resolv
 MODEL_PATH = "best.pt"
 DB_PATH    = "ppe_violations.db"
 
-CLASS_COLORS = {
-    "Hardhat"       : (0, 220, 90),
-    "Mask"          : (0, 200, 255),
-    "Safety Vest"   : (0, 180, 80),
-    "NO-Hardhat"    : (220, 30,  30),
-    "NO-Mask"       : (200, 50,  200),
-    "NO-Safety Vest": (220, 80,  0),
-    "Person"        : (100, 180, 255),
-    "Safety Cone"   : (255, 200, 0),
-    "machinery"     : (160, 160, 160),
-    "vehicle"       : (120, 120, 220),
-}
-
 RTC_CONFIG = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
@@ -160,71 +148,6 @@ def get_db() -> ViolationRepository:
     return repo
 
 
-# ─── Drawing ──────────────────────────────────────────────────────────────────
-def draw_detections(
-    frame: np.ndarray,
-    results,
-    conf_thresh: float,
-) -> tuple[np.ndarray, int, list[str], list[str], list[tuple]]:
-    """
-    Annotate frame with bounding boxes, track IDs, confidence labels, and
-    a status banner.
-
-    Returns:
-        (annotated_frame, total_boxes, violation_names, compliant_names,
-         raw_detections[(track_id_or_None, class_name)])
-    """
-    violations: list[str]  = []
-    compliant:  list[str]  = []
-    raw:        list[tuple] = []
-    total = 0
-
-    for r in results:
-        if r.boxes is None:
-            continue
-        track_ids = (
-            r.boxes.id.int().tolist()
-            if r.boxes.id is not None
-            else [None] * len(r.boxes)
-        )
-        for box, tid in zip(r.boxes, track_ids):
-            conf = float(box.conf[0])
-            if conf < conf_thresh:
-                continue
-
-            cls_id = int(box.cls[0])
-            name   = r.names[cls_id]
-            color  = CLASS_COLORS.get(name, (200, 200, 200))
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            total += 1
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            id_prefix = f"#{tid} " if tid is not None else ""
-            label     = f"{id_prefix}{name} {conf:.2f}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-            cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
-            cv2.putText(frame, label, (x1 + 3, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 2)
-
-            raw.append((tid, name))
-            if name in VIOLATION_CLASSES:
-                violations.append(name)
-            elif name in COMPLIANT_CLASSES:
-                compliant.append(name)
-
-    h, w = frame.shape[:2]
-    if violations:
-        cv2.rectangle(frame, (0, 0), (w, 40), (180, 0, 0), -1)
-        cv2.putText(frame, f"  VIOLATION: {', '.join(set(violations))}", (6, 27),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
-    elif compliant:
-        cv2.rectangle(frame, (0, 0), (w, 40), (0, 140, 40), -1)
-        cv2.putText(frame, "  ALL PPE COMPLIANT", (6, 27),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
-
-    return frame, total, violations, compliant, raw
-
-
 # ─── WebRTC Processor ─────────────────────────────────────────────────────────
 class PPEProcessor(VideoProcessorBase):
     """
@@ -236,6 +159,10 @@ class PPEProcessor(VideoProcessorBase):
     """
 
     def __init__(self):
+        if not os.path.exists(MODEL_PATH):
+            raise RuntimeError(
+                "Model weights not found — reload the page to trigger download."
+            )
         # Own YOLO instance — tracker state must NOT be shared between sessions
         self._model   = YOLO(MODEL_PATH)
         self._tracker = ViolationTracker()
@@ -331,7 +258,7 @@ with st.sidebar:
         else:
             st.markdown(f'<span class="class-tag tag-info">🔵 {cls}</span>', unsafe_allow_html=True)
     st.markdown("---")
-    st.markdown("**Built by Arun S**  \nAI/ML Engineer  \n[LinkedIn](https://linkedin.com/in/arun-s-481b2b3a2) · [GitHub](https://github.com/Arunsuresh677)")
+    st.markdown("**Built by Arun S**  \nAI/ML Engineer  \n[LinkedIn](https://linkedin.com/in/arun-suresh-481b2b3a2) · [GitHub](https://github.com/Arunsuresh677)")
 
 # ─── Header ───────────────────────────────────────────────────────────────────
 st.markdown("# 🦺 PPE Compliance Monitor")

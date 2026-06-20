@@ -89,7 +89,7 @@ def _draw_status_banner(
 ) -> None:
     h, w = frame.shape[:2]
     if violations:
-        cv2.rectangle(frame, (0, 0), (w, 40), (180, 0, 0), -1)
+        cv2.rectangle(frame, (0, 0), (w, 40), (0, 0, 180), -1)
         cv2.putText(
             frame,
             f"  VIOLATION: {', '.join(set(violations))}",
