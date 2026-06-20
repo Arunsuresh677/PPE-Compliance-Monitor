@@ -1,14 +1,19 @@
+import logging
 import os
-import time
-import urllib.request
 import tempfile
 import threading
+import time
+import urllib.request
+import urllib.error
+
 import av
 import cv2
 import numpy as np
 import streamlit as st
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+
+log = logging.getLogger(__name__)
 
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -117,14 +122,57 @@ RTC_CONFIG = RTCConfiguration({
 
 # ─── Model loader ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
-def load_model():
+def load_model() -> YOLO:
+    """
+    Download model weights from HuggingFace (first run only) and load YOLO.
+
+    Uses an atomic write pattern: download to a temp file beside the target,
+    then rename on success. A failed or interrupted download never leaves a
+    corrupt best.pt on disk, so the next call always retries cleanly.
+    """
     if not os.path.exists(MODEL_PATH):
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    return YOLO(MODEL_PATH)
+        tmp_path = MODEL_PATH + ".tmp"
+        try:
+            log.info("Downloading model weights from HuggingFace…")
+            urllib.request.urlretrieve(MODEL_URL, tmp_path)
+            os.replace(tmp_path, MODEL_PATH)   # atomic on POSIX; near-atomic on Windows
+            log.info("Model downloaded to %s", MODEL_PATH)
+        except Exception as exc:
+            # Clean up any partial download so the next run retries.
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise RuntimeError(
+                f"Failed to download model weights from {MODEL_URL}: {exc}"
+            ) from exc
+
+    try:
+        return YOLO(MODEL_PATH)
+    except Exception as exc:
+        # Corrupt weights file — remove so the next run re-downloads.
+        log.error("YOLO failed to load %s — deleting corrupt file: %s", MODEL_PATH, exc)
+        os.remove(MODEL_PATH)
+        raise RuntimeError(
+            f"Model file {MODEL_PATH} was corrupt and has been deleted. "
+            "Reload the page to re-download."
+        ) from exc
+
 
 # ─── Draw detections ──────────────────────────────────────────────────────────
-def draw_detections(frame, results, conf_thresh=0.5):
-    violations, compliant = [], []
+def draw_detections(
+    frame: np.ndarray,
+    results,
+    conf_thresh: float = 0.5,
+) -> tuple[np.ndarray, int, list[str], list[str]]:
+    """
+    Overlay bounding boxes, labels, and a status banner on *frame* (in-place).
+
+    Returns (annotated_frame, total_detections, violation_names, compliant_names).
+    The model is already called with the same conf_thresh, so boxes below the
+    threshold will not appear in results — the per-box check here is a
+    belt-and-suspenders guard for callers that pass a looser model threshold.
+    """
+    violations: list[str] = []
+    compliant:  list[str] = []
     total = 0
 
     for r in results:
@@ -164,34 +212,72 @@ def draw_detections(frame, results, conf_thresh=0.5):
 
     return frame, total, violations, compliant
 
+
 # ─── WebRTC Processor ─────────────────────────────────────────────────────────
 class PPEProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.model    = load_model()
-        self.conf     = 0.5
-        self.lock     = threading.Lock()
-        self.fps      = 0.0
-        self._last_ts = time.time()
-        self.stats    = {"total": 0, "violations": 0, "compliant": 0}
+    """
+    Per-connection YOLOv8 inference processor for streamlit-webrtc.
 
-    def recv(self, frame):
+    All attributes shared between the recv() thread and the Streamlit main
+    thread are read and written under self.lock to prevent data races.
+    """
+
+    def __init__(self):
+        self._model   = load_model()   # uses cached singleton — no extra load
+        self.lock     = threading.Lock()
+        self._conf    = 0.5
+        self._fps     = 0.0
+        self._last_ts = time.monotonic()
+        self._stats   = {"total": 0, "violations": 0, "compliant": 0}
+
+    # ── Thread-safe conf property ──────────────────────────────────────────
+    @property
+    def conf(self) -> float:
+        with self.lock:
+            return self._conf
+
+    @conf.setter
+    def conf(self, value: float) -> None:
+        with self.lock:
+            self._conf = float(value)
+
+    @property
+    def fps(self) -> float:
+        with self.lock:
+            return self._fps
+
+    @property
+    def stats(self) -> dict:
+        with self.lock:
+            return dict(self._stats)
+
+    # ── WebRTC callback (runs in its own thread) ───────────────────────────
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
 
-        now = time.time()
+        now = time.monotonic()
         with self.lock:
-            self.fps      = 1.0 / max(now - self._last_ts, 1e-6)
+            elapsed       = now - self._last_ts
+            self._fps     = 1.0 / elapsed if elapsed > 0 else 0.0
             self._last_ts = now
+            conf          = self._conf
 
-        results = self.model(img, conf=self.conf, verbose=False)
-        img, total, viols, comp = draw_detections(img, results, self.conf)
+        results = self._model(img, conf=conf, verbose=False)
+        img, total, viols, comp = draw_detections(img, results, conf)
 
         with self.lock:
-            self.stats = {"total": total, "violations": len(viols), "compliant": len(comp)}
+            self._stats = {
+                "total"      : total,
+                "violations" : len(viols),
+                "compliant"  : len(comp),
+            }
 
-        cv2.putText(img, f"FPS: {self.fps:.1f}", (img.shape[1] - 110, img.shape[0] - 10),
+        cv2.putText(img, f"FPS: {self._fps:.1f}",
+                    (img.shape[1] - 110, img.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (88, 166, 255), 2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
+
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -218,8 +304,12 @@ st.markdown("# 🦺 PPE Compliance Monitor")
 st.markdown("Real-time safety detection · YOLOv8 · 10 Classes · Construction & Industrial")
 st.markdown("---")
 
-with st.spinner("Loading model…"):
-    model = load_model()
+try:
+    with st.spinner("Loading model…"):
+        model = load_model()
+except RuntimeError as e:
+    st.error(f"⚠️ Model load failed: {e}")
+    st.stop()
 
 # ─── IMAGE MODE ───────────────────────────────────────────────────────────────
 if mode == "📷 Image":
@@ -227,86 +317,121 @@ if mode == "📷 Image":
     if uploaded:
         file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
         frame      = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        results    = model(frame, conf=conf_thresh, verbose=False)
-        out_frame, total, viols, comp = draw_detections(frame.copy(), results, conf_thresh)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Original**")
-            st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
-        with col2:
-            st.markdown("**Detections**")
-            st.image(cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-        st.markdown("#### Summary")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Detections", total)
-        c2.metric("✅ Compliant",     len(comp))
-        c3.metric("❌ Violations",    len(viols))
-
-        if viols:
-            st.markdown(f'<div class="alert-viol">⚠ VIOLATION DETECTED &nbsp;·&nbsp; {", ".join(set(viols))}</div>',
-                        unsafe_allow_html=True)
-        elif comp:
-            st.markdown('<div class="alert-ok">✅ ALL PPE COMPLIANT — No violations detected</div>',
-                        unsafe_allow_html=True)
+        if frame is None:
+            st.error("Could not decode the uploaded image. Please try a different file.")
         else:
-            st.info("No PPE classes detected. Try lowering the confidence threshold.")
+            results    = model(frame, conf=conf_thresh, verbose=False)
+            out_frame, total, viols, comp = draw_detections(frame.copy(), results, conf_thresh)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Original**")
+                st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
+            with col2:
+                st.markdown("**Detections**")
+                st.image(cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+            st.markdown("#### Summary")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Detections", total)
+            c2.metric("✅ Compliant",     len(comp))
+            c3.metric("❌ Violations",    len(viols))
+
+            if viols:
+                st.markdown(
+                    f'<div class="alert-viol">⚠ VIOLATION DETECTED &nbsp;·&nbsp; {", ".join(set(viols))}</div>',
+                    unsafe_allow_html=True,
+                )
+            elif comp:
+                st.markdown(
+                    '<div class="alert-ok">✅ ALL PPE COMPLIANT — No violations detected</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.info("No PPE classes detected. Try lowering the confidence threshold.")
 
 # ─── VIDEO MODE ───────────────────────────────────────────────────────────────
 elif mode == "🎞️ Video":
     uploaded = st.file_uploader("Upload a video", type=["mp4", "avi", "mov"])
     if uploaded:
+        # Write to a named temp file so OpenCV can open it by path.
+        # delete=False because we close the handle before VideoCapture opens it
+        # (required on Windows — a file open by one handle cannot be opened by
+        # another). We clean up explicitly in the finally block.
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tfile.write(uploaded.read())
-        tfile.flush()
+        tmp_path = tfile.name
+        try:
+            tfile.write(uploaded.read())
+            tfile.close()   # must close before VideoCapture on Windows
 
-        cap          = cv2.VideoCapture(tfile.name)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps_src      = cap.get(cv2.CAP_PROP_FPS) or 25
-        skip         = max(1, int(fps_src // 10))  # ~10 processed fps
+            cap = cv2.VideoCapture(tmp_path)
+            try:
+                if not cap.isOpened():
+                    st.error("Could not open the uploaded video. Please try a different file.")
+                else:
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    fps_src      = cap.get(cv2.CAP_PROP_FPS) or 25
+                    skip         = max(1, int(fps_src // 10))  # process ~10 fps
 
-        stframe  = st.empty()
-        progress = st.progress(0)
-        c1, c2, c3 = st.columns(3)
-        m_total = c1.empty(); m_comp = c2.empty(); m_viol = c3.empty()
-        log_box = st.empty()
-        stop_btn = st.button("⏹ Stop")
+                    stframe  = st.empty()
+                    progress = st.progress(0)
+                    c1, c2, c3 = st.columns(3)
+                    m_total = c1.empty(); m_comp = c2.empty(); m_viol = c3.empty()
+                    log_box  = st.empty()
+                    stop_btn = st.button("⏹ Stop")
 
-        log_entries = []
-        frame_idx   = 0
+                    # Cap log_entries at 500 to avoid unbounded memory growth on
+                    # long videos (only the last 20 are rendered at a time anyway).
+                    log_entries: list[str] = []
+                    _LOG_CAP = 500
+                    frame_idx = 0
 
-        while cap.isOpened() and not stop_btn:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_idx += 1
-            if frame_idx % skip != 0:
-                continue
+                    while cap.isOpened() and not stop_btn:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        frame_idx += 1
+                        if frame_idx % skip != 0:
+                            continue
 
-            results = model(frame, conf=conf_thresh, verbose=False)
-            out_frame, total, viols, comp = draw_detections(frame.copy(), results, conf_thresh)
+                        results = model(frame, conf=conf_thresh, verbose=False)
+                        out_frame, total, viols, comp = draw_detections(
+                            frame.copy(), results, conf_thresh
+                        )
 
-            stframe.image(cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
-            progress.progress(min(frame_idx / max(total_frames, 1), 1.0))
-            m_total.metric("Detections",   total)
-            m_comp.metric("✅ Compliant",  len(comp))
-            m_viol.metric("❌ Violations", len(viols))
+                        stframe.image(
+                            cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB),
+                            use_container_width=True,
+                        )
+                        progress.progress(min(frame_idx / max(total_frames, 1), 1.0))
+                        m_total.metric("Detections",   total)
+                        m_comp.metric("✅ Compliant",  len(comp))
+                        m_viol.metric("❌ Violations", len(viols))
 
-            if viols:
-                entry = f'<div class="log-entry log-viol">[{frame_idx:05d}] ⚠ {", ".join(set(viols))}</div>'
-            elif comp:
-                entry = f'<div class="log-entry log-ok">[{frame_idx:05d}] ✓ Compliant</div>'
-            else:
-                entry = f'<div class="log-entry">[{frame_idx:05d}] — No detection</div>'
-            log_entries.append(entry)
-            log_box.markdown(
-                f'<div class="detection-log">{"".join(log_entries[-20:])}</div>',
-                unsafe_allow_html=True
-            )
+                        if viols:
+                            entry = f'<div class="log-entry log-viol">[{frame_idx:05d}] ⚠ {", ".join(set(viols))}</div>'
+                        elif comp:
+                            entry = f'<div class="log-entry log-ok">[{frame_idx:05d}] ✓ Compliant</div>'
+                        else:
+                            entry = f'<div class="log-entry">[{frame_idx:05d}] — No detection</div>'
 
-        cap.release()
-        st.success(f"✅ Done — processed {frame_idx} frames")
+                        if len(log_entries) >= _LOG_CAP:
+                            log_entries = log_entries[-(_LOG_CAP // 2):]
+                        log_entries.append(entry)
+                        log_box.markdown(
+                            f'<div class="detection-log">{"".join(log_entries[-20:])}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    st.success(f"✅ Done — processed {frame_idx} frames")
+            finally:
+                cap.release()
+        finally:
+            # Always delete the temp file, even if an exception occurs.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 # ─── WEBCAM MODE ──────────────────────────────────────────────────────────────
 elif mode == "📹 Live Webcam":
@@ -321,6 +446,7 @@ elif mode == "📹 Live Webcam":
     )
 
     if ctx.video_processor:
+        # conf setter acquires the lock internally — safe to call from main thread
         ctx.video_processor.conf = conf_thresh
 
         stat_cols  = st.columns(3)
@@ -330,14 +456,13 @@ elif mode == "📹 Live Webcam":
         fps_disp   = st.empty()
 
         while ctx.state.playing:
-            with ctx.video_processor.lock:
-                s   = ctx.video_processor.stats
-                fps = ctx.video_processor.fps
+            s   = ctx.video_processor.stats   # returns a copy under lock
+            fps = ctx.video_processor.fps
             stat_total.metric("Detections",   s["total"])
             stat_comp.metric("✅ Compliant",  s["compliant"])
             stat_viol.metric("❌ Violations", s["violations"])
             fps_disp.markdown(
                 f'<span class="fps-badge">⚡ {fps:.1f} FPS</span>',
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
             time.sleep(0.3)
