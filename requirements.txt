@@ -1,14 +1,21 @@
+# Core inference
 ultralytics>=8.0.0
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 Pillow>=9.5.0
+
+# Deep learning backend
 torch>=2.0.0
 torchvision>=0.15.0
+
+# Training utilities
 matplotlib>=3.7.0
 PyYAML>=6.0
 tqdm>=4.65.0
 requests>=2.31.0
+
+# Web app
 streamlit>=1.28.0
-streamlit-webrtc==0.47.6
+streamlit-webrtc>=0.47.6
 av>=10.0.0
 aiortc>=1.6.0
