@@ -4,7 +4,7 @@ import tempfile
 import threading
 import time
 import urllib.request
-import urllib.error
+from datetime import datetime
 
 import av
 import cv2
@@ -12,6 +12,9 @@ import numpy as np
 import streamlit as st
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+
+import database
+from tracker import ViolationTracker, VIOLATION_CLASSES, COMPLIANT_CLASSES
 
 log = logging.getLogger(__name__)
 
@@ -38,10 +41,8 @@ section[data-testid="stSidebar"] * { color: #c9d1d9 !important; }
 .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
 
 div[data-testid="stMetric"] {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 10px;
-    padding: 14px 18px;
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 10px; padding: 14px 18px;
 }
 div[data-testid="stMetric"] label { color: #8b949e !important; font-family: 'Share Tech Mono', monospace; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
 div[data-testid="stMetricValue"] { color: #58a6ff; font-size: 1.8rem; font-weight: 700; }
@@ -85,33 +86,33 @@ div[data-testid="stFileUploader"] {
 }
 .detection-log {
     background: #010409; border: 1px solid #21262d; border-radius: 8px;
-    padding: 10px 14px; max-height: 180px; overflow-y: auto;
+    padding: 10px 14px; max-height: 220px; overflow-y: auto;
     font-family: 'Share Tech Mono', monospace; font-size: 0.8rem; color: #8b949e;
 }
-.log-entry { padding: 2px 0; border-bottom: 1px solid #21262d; }
-.log-viol  { color: #ff7b72; }
-.log-ok    { color: #3fb950; }
+.log-entry  { padding: 2px 0; border-bottom: 1px solid #21262d; }
+.log-viol   { color: #ff7b72; }
+.log-ok     { color: #3fb950; }
+.log-event  { color: #e3b341; }
 </style>
 """, unsafe_allow_html=True)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 MODEL_URL  = "https://huggingface.co/Arunsuresh677/ppe-compliance-monitor/resolve/main/best.pt"
 MODEL_PATH = "best.pt"
+DB_PATH    = "ppe_violations.db"
 
 CLASS_COLORS = {
-    "Hardhat":        (0, 220, 90),
-    "Mask":           (0, 200, 255),
-    "Safety Vest":    (0, 180, 80),
-    "NO-Hardhat":     (220, 30,  30),
-    "NO-Mask":        (200, 50,  200),
+    "Hardhat"       : (0, 220, 90),
+    "Mask"          : (0, 200, 255),
+    "Safety Vest"   : (0, 180, 80),
+    "NO-Hardhat"    : (220, 30,  30),
+    "NO-Mask"       : (200, 50,  200),
     "NO-Safety Vest": (220, 80,  0),
-    "Person":         (100, 180, 255),
-    "Safety Cone":    (255, 200, 0),
-    "machinery":      (160, 160, 160),
-    "vehicle":        (120, 120, 220),
+    "Person"        : (100, 180, 255),
+    "Safety Cone"   : (255, 200, 0),
+    "machinery"     : (160, 160, 160),
+    "vehicle"       : (120, 120, 220),
 }
-VIOLATION_CLASSES = {"NO-Hardhat", "NO-Mask", "NO-Safety Vest"}
-COMPLIANT_CLASSES = {"Hardhat", "Mask", "Safety Vest"}
 
 RTC_CONFIG = RTCConfiguration({
     "iceServers": [
@@ -120,68 +121,73 @@ RTC_CONFIG = RTCConfiguration({
     ]
 })
 
-# ─── Model loader ─────────────────────────────────────────────────────────────
+
+# ─── Shared resources ─────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_model() -> YOLO:
     """
-    Download model weights from HuggingFace (first run only) and load YOLO.
-
-    Uses an atomic write pattern: download to a temp file beside the target,
-    then rename on success. A failed or interrupted download never leaves a
-    corrupt best.pt on disk, so the next call always retries cleanly.
+    Download (atomically) and load YOLO weights.
+    A failed/interrupted download never leaves a corrupt best.pt on disk.
     """
     if not os.path.exists(MODEL_PATH):
-        tmp_path = MODEL_PATH + ".tmp"
+        tmp = MODEL_PATH + ".tmp"
         try:
             log.info("Downloading model weights from HuggingFace…")
-            urllib.request.urlretrieve(MODEL_URL, tmp_path)
-            os.replace(tmp_path, MODEL_PATH)   # atomic on POSIX; near-atomic on Windows
-            log.info("Model downloaded to %s", MODEL_PATH)
+            urllib.request.urlretrieve(MODEL_URL, tmp)
+            os.replace(tmp, MODEL_PATH)
         except Exception as exc:
-            # Clean up any partial download so the next run retries.
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise RuntimeError(
-                f"Failed to download model weights from {MODEL_URL}: {exc}"
-            ) from exc
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise RuntimeError(f"Model download failed: {exc}") from exc
 
     try:
         return YOLO(MODEL_PATH)
     except Exception as exc:
-        # Corrupt weights file — remove so the next run re-downloads.
-        log.error("YOLO failed to load %s — deleting corrupt file: %s", MODEL_PATH, exc)
+        log.error("Corrupt weights — deleting %s: %s", MODEL_PATH, exc)
         os.remove(MODEL_PATH)
         raise RuntimeError(
-            f"Model file {MODEL_PATH} was corrupt and has been deleted. "
-            "Reload the page to re-download."
+            "Model file was corrupt and has been deleted. Reload the page to re-download."
         ) from exc
 
 
-# ─── Draw detections ──────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_db() -> None:
+    """Initialise the SQLite violation log once per server process."""
+    database.init_db(DB_PATH)
+
+
+# ─── Drawing ──────────────────────────────────────────────────────────────────
 def draw_detections(
     frame: np.ndarray,
     results,
-    conf_thresh: float = 0.5,
-) -> tuple[np.ndarray, int, list[str], list[str]]:
+    conf_thresh: float,
+) -> tuple[np.ndarray, int, list[str], list[str], list[tuple]]:
     """
-    Overlay bounding boxes, labels, and a status banner on *frame* (in-place).
+    Annotate frame with bounding boxes, track IDs, confidence labels, and
+    a status banner.
 
-    Returns (annotated_frame, total_detections, violation_names, compliant_names).
-    The model is already called with the same conf_thresh, so boxes below the
-    threshold will not appear in results — the per-box check here is a
-    belt-and-suspenders guard for callers that pass a looser model threshold.
+    Returns:
+        (annotated_frame, total_boxes, violation_names, compliant_names,
+         raw_detections[(track_id_or_None, class_name)])
     """
-    violations: list[str] = []
-    compliant:  list[str] = []
+    violations: list[str]  = []
+    compliant:  list[str]  = []
+    raw:        list[tuple] = []
     total = 0
 
     for r in results:
         if r.boxes is None:
             continue
-        for box in r.boxes:
+        track_ids = (
+            r.boxes.id.int().tolist()
+            if r.boxes.id is not None
+            else [None] * len(r.boxes)
+        )
+        for box, tid in zip(r.boxes, track_ids):
             conf = float(box.conf[0])
             if conf < conf_thresh:
                 continue
+
             cls_id = int(box.cls[0])
             name   = r.names[cls_id]
             color  = CLASS_COLORS.get(name, (200, 200, 200))
@@ -189,12 +195,14 @@ def draw_detections(
             total += 1
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            label = f"{name} {conf:.2f}"
+            id_prefix = f"#{tid} " if tid is not None else ""
+            label     = f"{id_prefix}{name} {conf:.2f}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
             cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
             cv2.putText(frame, label, (x1 + 3, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 2)
 
+            raw.append((tid, name))
             if name in VIOLATION_CLASSES:
                 violations.append(name)
             elif name in COMPLIANT_CLASSES:
@@ -210,27 +218,33 @@ def draw_detections(
         cv2.putText(frame, "  ALL PPE COMPLIANT", (6, 27),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
 
-    return frame, total, violations, compliant
+    return frame, total, violations, compliant, raw
 
 
 # ─── WebRTC Processor ─────────────────────────────────────────────────────────
 class PPEProcessor(VideoProcessorBase):
     """
-    Per-connection YOLOv8 inference processor for streamlit-webrtc.
+    Per-connection YOLOv8 + ByteTrack processor for streamlit-webrtc.
 
-    All attributes shared between the recv() thread and the Streamlit main
-    thread are read and written under self.lock to prevent data races.
+    Each instance owns its own YOLO model (not the cached singleton) so that
+    model.track(persist=True) maintains independent tracker state per session.
+    All attributes shared with the Streamlit main thread are accessed under lock.
     """
 
     def __init__(self):
-        self._model   = load_model()   # uses cached singleton — no extra load
+        # Own YOLO instance — tracker state must NOT be shared between sessions
+        self._model   = YOLO(MODEL_PATH)
+        self._tracker = ViolationTracker()
+        self._session = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
         self.lock     = threading.Lock()
         self._conf    = 0.5
         self._fps     = 0.0
         self._last_ts = time.monotonic()
-        self._stats   = {"total": 0, "violations": 0, "compliant": 0}
+        self._stats   = {
+            "total": 0, "violations": 0, "compliant": 0,
+            "active_events": 0, "distinct_violators": 0,
+        }
 
-    # ── Thread-safe conf property ──────────────────────────────────────────
     @property
     def conf(self) -> float:
         with self.lock:
@@ -251,7 +265,6 @@ class PPEProcessor(VideoProcessorBase):
         with self.lock:
             return dict(self._stats)
 
-    # ── WebRTC callback (runs in its own thread) ───────────────────────────
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
 
@@ -262,14 +275,30 @@ class PPEProcessor(VideoProcessorBase):
             self._last_ts = now
             conf          = self._conf
 
-        results = self._model(img, conf=conf, verbose=False)
-        img, total, viols, comp = draw_detections(img, results, conf)
+        results = self._model.track(
+            img,
+            conf=conf,
+            tracker="bytetrack.yaml",
+            persist=True,
+            verbose=False,
+        )
+        img, total, viols, comp, raw = draw_detections(img, results, conf)
+
+        # Update tracker; persist closed events to SQLite
+        tracked = [(tid, cls) for tid, cls in raw if tid is not None]
+        active  = self._tracker.update(tracked)
+        for ev in self._tracker.flush_closed():
+            database.save_violation(ev, self._session)
+
+        distinct = len({ev.track_id for ev in active})
 
         with self.lock:
             self._stats = {
-                "total"      : total,
-                "violations" : len(viols),
-                "compliant"  : len(comp),
+                "total"             : total,
+                "violations"        : len(viols),
+                "compliant"         : len(comp),
+                "active_events"     : len(active),
+                "distinct_violators": distinct,
             }
 
         cv2.putText(img, f"FPS: {self._fps:.1f}",
@@ -282,7 +311,7 @@ class PPEProcessor(VideoProcessorBase):
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🦺 PPE Monitor")
-    st.caption("YOLOv8 · 10 Classes · Real-time")
+    st.caption("YOLOv8 + ByteTrack · 10 Classes · Real-time")
     st.markdown("---")
     conf_thresh = st.slider("Confidence Threshold", 0.10, 1.00, 0.50, 0.05)
     st.markdown("---")
@@ -301,9 +330,11 @@ with st.sidebar:
 
 # ─── Header ───────────────────────────────────────────────────────────────────
 st.markdown("# 🦺 PPE Compliance Monitor")
-st.markdown("Real-time safety detection · YOLOv8 · 10 Classes · Construction & Industrial")
+st.markdown("Real-time safety detection · YOLOv8 + ByteTrack · 10 Classes · Construction & Industrial")
 st.markdown("---")
 
+# Initialise shared resources
+get_db()
 try:
     with st.spinner("Loading model…"):
         model = load_model()
@@ -311,8 +342,10 @@ except RuntimeError as e:
     st.error(f"⚠️ Model load failed: {e}")
     st.stop()
 
+
 # ─── IMAGE MODE ───────────────────────────────────────────────────────────────
 if mode == "📷 Image":
+    st.info("Image mode uses single-frame detection (no tracking — ByteTrack needs video frames to assign IDs).")
     uploaded = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png", "bmp"])
     if uploaded:
         file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
@@ -320,8 +353,10 @@ if mode == "📷 Image":
         if frame is None:
             st.error("Could not decode the uploaded image. Please try a different file.")
         else:
-            results    = model(frame, conf=conf_thresh, verbose=False)
-            out_frame, total, viols, comp = draw_detections(frame.copy(), results, conf_thresh)
+            results = model(frame, conf=conf_thresh, verbose=False)
+            out_frame, total, viols, comp, _ = draw_detections(
+                frame.copy(), results, conf_thresh
+            )
 
             col1, col2 = st.columns(2)
             with col1:
@@ -350,41 +385,45 @@ if mode == "📷 Image":
             else:
                 st.info("No PPE classes detected. Try lowering the confidence threshold.")
 
+
 # ─── VIDEO MODE ───────────────────────────────────────────────────────────────
 elif mode == "🎞️ Video":
     uploaded = st.file_uploader("Upload a video", type=["mp4", "avi", "mov"])
     if uploaded:
-        # Write to a named temp file so OpenCV can open it by path.
-        # delete=False because we close the handle before VideoCapture opens it
-        # (required on Windows — a file open by one handle cannot be opened by
-        # another). We clean up explicitly in the finally block.
-        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        session = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+        tracker = ViolationTracker()
+
+        tfile    = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tmp_path = tfile.name
         try:
             tfile.write(uploaded.read())
-            tfile.close()   # must close before VideoCapture on Windows
+            tfile.close()   # close before VideoCapture (required on Windows)
 
             cap = cv2.VideoCapture(tmp_path)
             try:
                 if not cap.isOpened():
-                    st.error("Could not open the uploaded video. Please try a different file.")
+                    st.error("Could not open the video. Please try a different file.")
                 else:
                     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                     fps_src      = cap.get(cv2.CAP_PROP_FPS) or 25
-                    skip         = max(1, int(fps_src // 10))  # process ~10 fps
+                    skip         = max(1, int(fps_src // 10))
 
                     stframe  = st.empty()
                     progress = st.progress(0)
-                    c1, c2, c3 = st.columns(3)
-                    m_total = c1.empty(); m_comp = c2.empty(); m_viol = c3.empty()
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    m_total    = c1.empty()
+                    m_comp     = c2.empty()
+                    m_viol     = c3.empty()
+                    m_events   = c4.empty()
+
                     log_box  = st.empty()
                     stop_btn = st.button("⏹ Stop")
 
-                    # Cap log_entries at 500 to avoid unbounded memory growth on
-                    # long videos (only the last 20 are rendered at a time anyway).
                     log_entries: list[str] = []
                     _LOG_CAP = 500
                     frame_idx = 0
+                    closed_events: list[dict] = []
 
                     while cap.isOpened() and not stop_btn:
                         ret, frame = cap.read()
@@ -394,19 +433,39 @@ elif mode == "🎞️ Video":
                         if frame_idx % skip != 0:
                             continue
 
-                        results = model(frame, conf=conf_thresh, verbose=False)
-                        out_frame, total, viols, comp = draw_detections(
+                        results = model.track(
+                            frame,
+                            conf=conf_thresh,
+                            tracker="bytetrack.yaml",
+                            persist=True,
+                            verbose=False,
+                        )
+                        out_frame, total, viols, comp, raw = draw_detections(
                             frame.copy(), results, conf_thresh
                         )
+
+                        # Tracker update
+                        tracked = [(tid, cls) for tid, cls in raw if tid is not None]
+                        active  = tracker.update(tracked)
+                        for ev in tracker.flush_closed():
+                            database.save_violation(ev, session)
+                            closed_events.append(ev.to_dict())
+                            log_entries.append(
+                                f'<div class="log-entry log-event">'
+                                f'[{frame_idx:05d}] EVENT CLOSED  '
+                                f'Worker #{ev.track_id}  {ev.violation_class}  '
+                                f'{ev.duration_secs:.1f}s</div>'
+                            )
 
                         stframe.image(
                             cv2.cvtColor(out_frame, cv2.COLOR_BGR2RGB),
                             use_container_width=True,
                         )
                         progress.progress(min(frame_idx / max(total_frames, 1), 1.0))
-                        m_total.metric("Detections",   total)
-                        m_comp.metric("✅ Compliant",  len(comp))
-                        m_viol.metric("❌ Violations", len(viols))
+                        m_total.metric("Detections",    total)
+                        m_comp.metric("✅ Compliant",   len(comp))
+                        m_viol.metric("❌ Violations",  len(viols))
+                        m_events.metric("Events logged", len(closed_events))
 
                         if viols:
                             entry = f'<div class="log-entry log-viol">[{frame_idx:05d}] ⚠ {", ".join(set(viols))}</div>'
@@ -419,24 +478,50 @@ elif mode == "🎞️ Video":
                             log_entries = log_entries[-(_LOG_CAP // 2):]
                         log_entries.append(entry)
                         log_box.markdown(
-                            f'<div class="detection-log">{"".join(log_entries[-20:])}</div>',
+                            f'<div class="detection-log">{"".join(log_entries[-25:])}</div>',
                             unsafe_allow_html=True,
                         )
 
-                    st.success(f"✅ Done — processed {frame_idx} frames")
+                    # Flush remaining open events at end of video
+                    for ev in tracker.close_all():
+                        database.save_violation(ev, session)
+                        closed_events.append(ev.to_dict())
+
+                    st.success(f"✅ Done — {frame_idx} frames · {len(closed_events)} violation events logged")
+
+                    # ── Session analytics ──────────────────────────────────
+                    if closed_events:
+                        st.markdown("#### Violation Event Log")
+                        summary = database.get_session_summary(session)
+                        sa, sb, sc = st.columns(3)
+                        sa.metric("Total Events",       summary.get("total_events", 0))
+                        sb.metric("Distinct Violators", summary.get("distinct_violators", 0))
+                        sc.metric("Violation Types",    len(summary.get("by_class", {})))
+
+                        rows = database.get_violations(session=session)
+                        st.dataframe(
+                            rows,
+                            column_order=["track_id", "violation_class", "start_time",
+                                          "end_time", "duration_secs", "frame_count"],
+                            use_container_width=True,
+                        )
+
             finally:
                 cap.release()
         finally:
-            # Always delete the temp file, even if an exception occurs.
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
+
 # ─── WEBCAM MODE ──────────────────────────────────────────────────────────────
 elif mode == "📹 Live Webcam":
-    st.markdown("### 📹 Live Webcam — Real-time PPE Detection")
-    st.info("Click **START** → allow camera access → live PPE detection runs on every frame.")
+    st.markdown("### 📹 Live Webcam — Real-time PPE Detection + ByteTrack")
+    st.info(
+        "Click **START** → allow camera access → live PPE detection with worker tracking. "
+        "Each worker gets a persistent ID (#N) and violations are logged by duration."
+    )
 
     ctx = webrtc_streamer(
         key="ppe-webcam",
@@ -446,23 +531,67 @@ elif mode == "📹 Live Webcam":
     )
 
     if ctx.video_processor:
-        # conf setter acquires the lock internally — safe to call from main thread
         ctx.video_processor.conf = conf_thresh
 
-        stat_cols  = st.columns(3)
-        stat_total = stat_cols[0].empty()
-        stat_comp  = stat_cols[1].empty()
-        stat_viol  = stat_cols[2].empty()
-        fps_disp   = st.empty()
+        col1, col2 = st.columns([2, 1])
+
+        with col1:
+            stat_cols  = st.columns(4)
+            stat_total = stat_cols[0].empty()
+            stat_comp  = stat_cols[1].empty()
+            stat_viol  = stat_cols[2].empty()
+            stat_ev    = stat_cols[3].empty()
+            fps_disp   = st.empty()
+
+        with col2:
+            st.markdown("**Live Violation Events (DB)**")
+            events_box = st.empty()
 
         while ctx.state.playing:
-            s   = ctx.video_processor.stats   # returns a copy under lock
+            s   = ctx.video_processor.stats
             fps = ctx.video_processor.fps
-            stat_total.metric("Detections",   s["total"])
-            stat_comp.metric("✅ Compliant",  s["compliant"])
-            stat_viol.metric("❌ Violations", s["violations"])
+
+            stat_total.metric("Detections",         s["total"])
+            stat_comp.metric("✅ Compliant",        s["compliant"])
+            stat_viol.metric("❌ Violations",       s["violations"])
+            stat_ev.metric("Active events",         s["active_events"])
             fps_disp.markdown(
-                f'<span class="fps-badge">⚡ {fps:.1f} FPS</span>',
+                f'<span class="fps-badge">⚡ {fps:.1f} FPS  '
+                f'· {s["distinct_violators"]} active violator(s)</span>',
                 unsafe_allow_html=True,
             )
+
+            # Pull latest events from DB for live display
+            recent = database.get_violations(limit=10)
+            if recent:
+                rows_html = "".join(
+                    f'<div class="log-entry log-event">'
+                    f'#{r["track_id"]}  {r["violation_class"]}  '
+                    f'{r["duration_secs"]:.1f}s</div>'
+                    for r in recent
+                )
+                events_box.markdown(
+                    f'<div class="detection-log">{rows_html}</div>',
+                    unsafe_allow_html=True,
+                )
+
             time.sleep(0.3)
+
+        # ── Post-session analytics ─────────────────────────────────────────
+        if ctx.video_processor:
+            session = ctx.video_processor._session
+            summary = database.get_session_summary(session)
+            if summary.get("total_events", 0) > 0:
+                st.markdown("#### Session Summary")
+                sa, sb, sc = st.columns(3)
+                sa.metric("Total Events",       summary["total_events"])
+                sb.metric("Distinct Violators", summary["distinct_violators"])
+                sc.metric("Violation Types",    len(summary.get("by_class", {})))
+
+                rows = database.get_violations(session=session)
+                st.dataframe(
+                    rows,
+                    column_order=["track_id", "violation_class", "start_time",
+                                  "end_time", "duration_secs", "frame_count"],
+                    use_container_width=True,
+                )

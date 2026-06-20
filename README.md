@@ -4,7 +4,7 @@
 
 # PPE Compliance Monitor
 
-### Real-Time Worker Safety Detection · YOLOv8 · 10 Classes · Construction & Industrial
+### Real-Time Worker Safety Detection · YOLOv8 + ByteTrack · 10 Classes · Construction & Industrial
 
 [![Live Demo](https://img.shields.io/badge/🚀%20Live%20Demo-Streamlit%20Cloud-ff4b4b?style=flat-square&logo=streamlit)](https://ppe-compliance-monitor-7ssrkxc83lsifmxnfngote.streamlit.app/)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
@@ -67,28 +67,46 @@ Workplace safety violations kill thousands of workers every year. This system gi
 ┌─────────────────────────────────────────────────────────────────┐
 │                      YOLOv8s Inference                          │
 │   • 640×640 input  • conf threshold  • 10-class detection      │
-│   • Hosted on HuggingFace, auto-downloaded on first run        │
+│   • Weights hosted on HuggingFace, auto-downloaded first run   │
 └────────────────────────────┬────────────────────────────────────┘
                              │
-               ┌─────────────┴──────────────┐
-               ▼                            ▼
-  ┌─────────────────────┐      ┌────────────────────────┐
-  │  Streamlit Web App  │      │   CLI (detect.py)      │
-  │  • Image upload     │      │  • RTSP livestream     │
-  │  • Video upload     │      │  • Video file          │
-  │  • Live webcam      │      │  • Image file          │
-  │    (WebRTC)         │      │  • Save annotated MP4  │
-  └─────────────────────┘      └────────────────────────┘
-               │
-               ▼
-  ┌─────────────────────┐
-  │   Annotated Output  │
-  │  Bounding boxes     │
-  │  Confidence scores  │
-  │  Status banner      │
-  │  (COMPLIANT /       │
-  │   VIOLATION)        │
-  └─────────────────────┘
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   ByteTrack (per-frame tracking)                │
+│   • Assigns persistent ID to each detected worker              │
+│   • Survives brief occlusion (3s stale timeout)                │
+│   • Enables: duration, distinct violators, repeat offenders    │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              ViolationTracker (tracker.py)                      │
+│   • State machine: one ViolationEvent per (worker, class)      │
+│   • Opens on first violation frame, closes on compliance/exit  │
+│   • Emits closed events to SQLite                              │
+└──────────┬────────────────────────────────────────┬────────────┘
+           │                                        │
+           ▼                                        ▼
+┌─────────────────────┐                 ┌───────────────────────┐
+│  Streamlit Web App  │                 │   CLI (detect.py)     │
+│  • Image upload     │                 │  • RTSP livestream    │
+│  • Video + tracking │                 │  • Video + tracking   │
+│  • Live webcam      │                 │  • Session summary    │
+│    (WebRTC)         │                 │  • Save annotated MP4 │
+│  • Violation log    │                 └───────────────────────┘
+│  • Session analytics│
+└─────────────────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  SQLite (database.py)│
+│  violation_events   │
+│  • track_id         │
+│  • violation_class  │
+│  • start / end time │
+│  • duration_secs    │
+│  • frame_count      │
+└─────────────────────┘
 ```
 
 ---
@@ -138,6 +156,8 @@ python detect.py [OPTIONS]
 | `--save` | off | Save annotated output to `--output` directory |
 | `--output` | `output/` | Output directory when `--save` is set |
 | `--no-show` | off | Suppress live display window |
+| `--no-track` | off | Disable ByteTrack (plain per-frame detection) |
+| `--db` | `ppe_violations.db` | SQLite path for violation event log |
 
 ### Examples
 
@@ -159,6 +179,54 @@ python detect.py --source 0 --conf 0.65 --device 0
 
 # Headless (no window) — for server-side processing
 python detect.py --source footage.mp4 --save --no-show
+```
+
+---
+
+## Worker Tracking & Violation Analytics
+
+The system uses **ByteTrack** (built into Ultralytics) to assign a persistent ID to each detected person across frames. This converts a stream of per-frame detections into discrete, timed violation events.
+
+### Without tracking (before)
+
+```
+Frame 001:  NO-Hardhat detected
+Frame 002:  NO-Hardhat detected
+Frame 003:  NO-Hardhat detected
+...         (600 identical events for a 1-minute violation)
+```
+
+### With ByteTrack (after)
+
+```
+Worker #7 · NO-Hardhat · started 09:14:32 · duration 58.3s · 580 frames
+Worker #12 · NO-Mask · started 09:15:01 · duration 12.1s · 121 frames
+```
+
+### What it enables
+
+| Capability | Description |
+|---|---|
+| **Distinct violator count** | "3 workers violated PPE this shift" |
+| **Violation duration** | How long each worker was non-compliant |
+| **Repeat offender detection** | Same track ID, multiple events |
+| **Compliance rate** | Compliant frames / total frames per worker |
+| **SQLite event log** | Every closed event persisted with timestamps |
+| **Session analytics** | Per-class breakdown, avg/max duration |
+
+### Violation event schema
+
+```sql
+CREATE TABLE violation_events (
+    id              INTEGER PRIMARY KEY,
+    session         TEXT,     -- ISO timestamp of detection run
+    track_id        INTEGER,  -- ByteTrack worker ID
+    violation_class TEXT,     -- e.g. "NO-Hardhat"
+    start_time      TEXT,     -- when violation began
+    end_time        TEXT,     -- when it ended
+    duration_secs   REAL,     -- wall-clock seconds
+    frame_count     INTEGER   -- YOLO frames active
+);
 ```
 
 ---
@@ -269,8 +337,10 @@ Weights are saved to `runs/ppe/exp1/weights/best.pt`.
 
 ```
 PPE-Compliance-Monito/
-├── app.py            # Streamlit web app (image / video / live webcam)
-├── detect.py         # CLI inference for webcam, video, image, RTSP
+├── app.py            # Streamlit web app (image / video / live webcam + tracking)
+├── detect.py         # CLI inference (webcam, video, image, RTSP + ByteTrack)
+├── tracker.py        # ViolationTracker state machine — per-ID event lifecycle
+├── database.py       # SQLite violation log (WAL mode, thread-safe)
 ├── train.py          # Training script (YOLOv8, YOLO data format)
 ├── requirements.txt  # Python dependencies
 ├── packages.txt      # System packages (for Streamlit Cloud)
