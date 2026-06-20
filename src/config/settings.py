@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
+    # Alerts
+    slack_webhook_url:     str   = ""
+    alert_violation_secs:  float = 30.0   # fire alert after this many seconds of continuous violation
+
     # Logging
     log_level: str = "INFO"
 

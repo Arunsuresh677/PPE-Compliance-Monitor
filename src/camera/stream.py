@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from src.alerts.manager import AlertManager
 from src.database.repository import ViolationRepository
 from src.detection.draw import draw_detections
 from src.tracking.violation_tracker import ViolationTracker
@@ -58,6 +59,7 @@ class CameraStream:
         self._conf    = conf
         self._model   = YOLO(model_path)
         self._tracker = ViolationTracker()
+        self._alerts  = AlertManager()
 
         self.lock:          threading.Lock    = threading.Lock()
         self._latest_frame: np.ndarray | None = None
@@ -172,6 +174,10 @@ class CameraStream:
                     distinct = len({ev.track_id for ev in active})
                     ACTIVE_WORKERS.labels(camera_id=self.camera_id).set(distinct)
 
+                    # Check violation duration alerts
+                    self._alerts.check_violations(self.camera_id, active)
+                    self._alerts.check_camera_status(self.camera_id, is_live=True)
+
                     cv2.putText(
                         out_frame,
                         f"{self.camera_id}  {fps:.1f} FPS",
@@ -195,6 +201,7 @@ class CameraStream:
                 cap.release()
 
             CAMERA_UP.labels(camera_id=self.camera_id).set(0)
+            self._alerts.check_camera_status(self.camera_id, is_live=False)
             if not self._stop_event.is_set():
                 retries += 1
                 self._stop_event.wait(_RECONNECT_DELAY)
