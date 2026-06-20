@@ -1,34 +1,60 @@
 version: "3.9"
 
 services:
-  app:
-    build: .
-    image: ppe-monitor:latest
-    ports:
-      - "8501:8501"
-    volumes:
-      - ./data:/app/data
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ppe_postgres
     environment:
-      PPE_DB_PATH: /app/data/violations.db
-      PPE_MODEL_PATH: /app/data/best.pt
-    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+      POSTGRES_USER:     ppe_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ppe_pass}
+      POSTGRES_DB:       ppe_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ppe_user -d ppe_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   api:
     build: .
     image: ppe-monitor:latest
+    container_name: ppe_api
     ports:
       - "8000:8000"
-    volumes:
-      - ./data:/app/data
     environment:
-      PPE_DB_PATH: /app/data/violations.db
-      PPE_API_HOST: "0.0.0.0"
-      PPE_API_PORT: "8000"
+      PPE_DATABASE_URL: postgresql://ppe_user:${POSTGRES_PASSWORD:-ppe_pass}@postgres:5432/ppe_db
+      PPE_API_HOST:     "0.0.0.0"
+      PPE_API_PORT:     "8000"
+      PPE_LOG_LEVEL:    ${LOG_LEVEL:-INFO}
     command: python -m src.api.server
     depends_on:
-      - app
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  app:
+    build: .
+    image: ppe-monitor:latest
+    container_name: ppe_app
+    ports:
+      - "8501:8501"
+    volumes:
+      - model_data:/app/data
+    environment:
+      PPE_DATABASE_URL: postgresql://ppe_user:${POSTGRES_PASSWORD:-ppe_pass}@postgres:5432/ppe_db
+      PPE_LOG_LEVEL:    ${LOG_LEVEL:-INFO}
+    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
-  data:
+  postgres_data:
+  model_data:

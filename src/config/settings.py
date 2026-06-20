@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     stale_timeout_secs: float = 3.0
 
     # Database
-    db_path: str = "ppe_violations.db"
+    database_url: str = "postgresql://ppe_user:ppe_pass@localhost:5432/ppe_db"
 
     # API server
     api_host: str = "0.0.0.0"

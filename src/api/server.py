@@ -2,11 +2,12 @@
 src/api/server.py — Lightweight FastAPI REST layer for violation data.
 
 Endpoints:
-    GET /health                           — liveness check
-    GET /api/violations?session=&limit=   — list violation events
-    GET /api/violations/{session}         — same, keyed by session path param
-    GET /api/summary/{session}            — aggregated stats
-    GET /api/sessions                     — list all known sessions
+    GET /health                                        — liveness check
+    GET /api/sessions                                  — list all sessions
+    GET /api/sessions/{session}/cameras                — list cameras for a session
+    GET /api/violations?session=&limit=&camera_id=     — list violation events
+    GET /api/violations/{session}                      — same, keyed by session path param
+    GET /api/summary/{session}                         — aggregated stats
 
 Run standalone:
     uvicorn src.api.server:app --host 0.0.0.0 --port 8000
@@ -58,21 +59,28 @@ def list_sessions() -> dict:
     return {"sessions": _get_repo().list_sessions()}
 
 
+@app.get("/api/sessions/{session}/cameras", tags=["data"])
+def list_cameras(session: str) -> dict:
+    return {"session": session, "cameras": _get_repo().list_cameras(session)}
+
+
 @app.get("/api/violations", tags=["data"])
 def get_violations(
-    session: str = Query(..., description="Session identifier"),
-    limit:   int = Query(500, ge=1, le=5000, description="Max rows to return"),
+    session:   str          = Query(..., description="Session identifier"),
+    limit:     int          = Query(500, ge=1, le=5000, description="Max rows to return"),
+    camera_id: str | None   = Query(None, description="Filter by camera ID"),
 ) -> dict:
-    events = _get_repo().get_violations(session, limit=limit)
+    events = _get_repo().get_violations(session, limit=limit, camera_id=camera_id)
     return {"session": session, "count": len(events), "events": events}
 
 
 @app.get("/api/violations/{session}", tags=["data"])
 def get_violations_by_path(
-    session: str,
-    limit: int = Query(500, ge=1, le=5000),
+    session:   str,
+    limit:     int        = Query(500, ge=1, le=5000),
+    camera_id: str | None = Query(None),
 ) -> dict:
-    events = _get_repo().get_violations(session, limit=limit)
+    events = _get_repo().get_violations(session, limit=limit, camera_id=camera_id)
     return {"session": session, "count": len(events), "events": events}
 
 
