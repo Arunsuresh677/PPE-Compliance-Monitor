@@ -23,6 +23,10 @@ from ultralytics import YOLO
 from src.database.repository import ViolationRepository
 from src.detection.draw import draw_detections
 from src.tracking.violation_tracker import ViolationTracker
+from src.metrics.prometheus import (
+    INFERENCE_LATENCY, FPS_GAUGE, VIOLATIONS_COUNTER,
+    ACTIVE_WORKERS, CAMERA_UP, EVENTS_SAVED, DB_WRITE_LATENCY,
+)
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +123,7 @@ class CameraStream:
             retries = 0
             with self.lock:
                 self._stats["status"] = "live"
+            CAMERA_UP.labels(camera_id=self.camera_id).set(1)
             log.info("[%s] connected", self.camera_id)
 
             last_ts = time.monotonic()
@@ -138,6 +143,7 @@ class CameraStream:
                     with self.lock:
                         conf = self._conf
 
+                    t_infer = time.monotonic()
                     results = self._model.track(
                         frame,
                         conf=conf,
@@ -145,21 +151,34 @@ class CameraStream:
                         persist=True,
                         verbose=False,
                     )
+                    INFERENCE_LATENCY.labels(camera_id=self.camera_id).observe(
+                        time.monotonic() - t_infer
+                    )
+
                     out_frame, total, viols, comp, raw = draw_detections(frame, results, conf)
+
+                    for v in viols:
+                        VIOLATIONS_COUNTER.labels(camera_id=self.camera_id, violation_class=v).inc()
 
                     tracked = [(tid, cls) for tid, cls in raw if tid is not None]
                     active  = self._tracker.update(tracked)
                     closed  = self._tracker.flush_closed()
                     if closed:
+                        t_db = time.monotonic()
                         self._repo.save_violations(closed, self.session, camera_id=self.camera_id)
+                        DB_WRITE_LATENCY.observe(time.monotonic() - t_db)
+                        EVENTS_SAVED.labels(camera_id=self.camera_id).inc(len(closed))
 
                     distinct = len({ev.track_id for ev in active})
+                    ACTIVE_WORKERS.labels(camera_id=self.camera_id).set(distinct)
 
                     cv2.putText(
                         out_frame,
                         f"{self.camera_id}  {fps:.1f} FPS",
                         (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (88, 166, 255), 2,
                     )
+
+                    FPS_GAUGE.labels(camera_id=self.camera_id).set(fps)
 
                     with self.lock:
                         self._latest_frame = out_frame
@@ -175,6 +194,7 @@ class CameraStream:
             finally:
                 cap.release()
 
+            CAMERA_UP.labels(camera_id=self.camera_id).set(0)
             if not self._stop_event.is_set():
                 retries += 1
                 self._stop_event.wait(_RECONNECT_DELAY)

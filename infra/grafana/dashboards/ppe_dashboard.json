@@ -1,0 +1,131 @@
+{
+  "title": "PPE Compliance Monitor",
+  "uid": "ppe-monitor-v1",
+  "tags": ["ppe", "safety", "yolo"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Camera Status",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{
+        "expr": "ppe_camera_up",
+        "legendFormat": "{{camera_id}}"
+      }],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "LIVE", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "FPS per Camera",
+      "type": "gauge",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [{
+        "expr": "ppe_fps",
+        "legendFormat": "{{camera_id}}"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 60, "unit": "fps",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "yellow", "value": 10 },
+              { "color": "green", "value": 25 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Active Workers per Camera",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [{
+        "expr": "ppe_active_workers",
+        "legendFormat": "{{camera_id}}"
+      }],
+      "options": { "colorMode": "value", "graphMode": "area" }
+    },
+    {
+      "id": 4,
+      "title": "Total Events Saved",
+      "type": "stat",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [{
+        "expr": "sum(ppe_events_saved_total)",
+        "legendFormat": "Total"
+      }],
+      "options": { "colorMode": "value", "graphMode": "area" }
+    },
+    {
+      "id": 5,
+      "title": "Violations per Minute (by Class)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "rate(ppe_violations_total[1m]) * 60",
+        "legendFormat": "{{camera_id}} — {{violation_class}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 2 } } }
+    },
+    {
+      "id": 6,
+      "title": "Inference Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(ppe_inference_duration_seconds_bucket[1m]))",
+          "legendFormat": "p50 {{camera_id}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(ppe_inference_duration_seconds_bucket[1m]))",
+          "legendFormat": "p95 {{camera_id}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(ppe_inference_duration_seconds_bucket[1m]))",
+          "legendFormat": "p99 {{camera_id}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 7,
+      "title": "DB Write Latency (p95)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 6 },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, rate(ppe_db_write_duration_seconds_bucket[1m]))",
+        "legendFormat": "p95 DB write"
+      }],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 8,
+      "title": "Violations by Camera (total)",
+      "type": "barchart",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 6 },
+      "targets": [{
+        "expr": "sum by (camera_id) (ppe_violations_total)",
+        "legendFormat": "{{camera_id}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    }
+  ]
+}

@@ -27,3 +27,6 @@ uvicorn[standard]>=0.24.0
 
 # Database
 psycopg2-binary>=2.9.0
+
+# Observability
+prometheus-client>=0.20.0

@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import time
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from src.config.settings import settings
 from src.database.repository import ViolationRepository
@@ -52,6 +53,11 @@ def _get_repo() -> ViolationRepository:
 @app.get("/health", tags=["ops"])
 def health() -> dict:
     return {"status": "ok", "timestamp": time.time()}
+
+
+@app.get("/metrics", tags=["ops"], include_in_schema=False)
+def metrics() -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/api/sessions", tags=["data"])
