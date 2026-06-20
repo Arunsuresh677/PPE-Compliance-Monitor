@@ -23,8 +23,8 @@ from pathlib import Path
 import cv2
 from ultralytics import YOLO
 
-import database
-from tracker import ViolationTracker, VIOLATION_CLASSES
+from src.database.repository import ViolationRepository
+from src.tracking.violation_tracker import ViolationTracker, VIOLATION_CLASSES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,7 +142,8 @@ def run(args: argparse.Namespace) -> None:
 
     # Session ID used to group all events from this run in the DB
     session = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    database.init_db(args.db)
+    repo = ViolationRepository(db_path=args.db)
+    repo.init()
 
     model  = YOLO(args.model)
     use_tracking = not args.no_track
@@ -183,7 +184,7 @@ def run(args: argparse.Namespace) -> None:
             cv2.imwrite(str(out_path), frame)
             log.info("Saved: %s", out_path)
         cv2.destroyAllWindows()
-        database.close_db()
+        repo.close()
         return
 
     # ── Video / Webcam / RTSP mode ────────────────────────────────────────
@@ -244,7 +245,7 @@ def run(args: argparse.Namespace) -> None:
                 tracked = [(tid, cls) for tid, cls in detections if tid is not None]
                 active  = tracker.update(tracked)
                 for ev in tracker.flush_closed():
-                    database.save_violation(ev, session)
+                    repo.save_violation(ev, session)
                     log.info(
                         "VIOLATION CLOSED  #%d %s  %.1fs  (%d frames)",
                         ev.track_id, ev.violation_class,
@@ -283,7 +284,7 @@ def run(args: argparse.Namespace) -> None:
         # Close any open tracker events before exiting
         if tracker is not None:
             for ev in tracker.close_all():
-                database.save_violation(ev, session)
+                repo.save_violation(ev, session)
 
         cap.release()
         if writer:
@@ -292,19 +293,16 @@ def run(args: argparse.Namespace) -> None:
 
         # ── Session summary ────────────────────────────────────────────
         if tracker is not None:
-            s = database.get_session_summary(session)
+            s = repo.get_session_summary(session)
             log.info("=" * 60)
             log.info("SESSION SUMMARY  [%s]", session)
             log.info("  Total violation events : %d", s.get("total_events", 0))
             log.info("  Distinct violators     : %d", s.get("distinct_violators", 0))
-            for cls, stats in s.get("by_class", {}).items():
-                log.info(
-                    "  %-20s %d events  avg %.1fs  max %.1fs",
-                    cls, stats["events"], stats["avg_secs"], stats["max_secs"],
-                )
+            for cls, count in s.get("by_class", {}).items():
+                log.info("  %-20s %d events", cls, count)
             log.info("=" * 60)
 
-        database.close_db()
+        repo.close()
         log.info("Detection complete.")
 
 

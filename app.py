@@ -13,8 +13,10 @@ import streamlit as st
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
-import database
-from tracker import ViolationTracker, VIOLATION_CLASSES, COMPLIANT_CLASSES
+from src.database.repository import ViolationRepository
+from src.tracking.violation_tracker import ViolationTracker, VIOLATION_CLASSES, COMPLIANT_CLASSES
+from src.detection.model import load_model as _load_model_impl
+from src.config.settings import settings
 
 log = logging.getLogger(__name__)
 
@@ -151,9 +153,11 @@ def load_model() -> YOLO:
 
 
 @st.cache_resource(show_spinner=False)
-def get_db() -> None:
-    """Initialise the SQLite violation log once per server process."""
-    database.init_db(DB_PATH)
+def get_db() -> ViolationRepository:
+    """Initialise and return the shared ViolationRepository (once per process)."""
+    repo = ViolationRepository(db_path=DB_PATH)
+    repo.init()
+    return repo
 
 
 # ─── Drawing ──────────────────────────────────────────────────────────────────
@@ -287,8 +291,9 @@ class PPEProcessor(VideoProcessorBase):
         # Update tracker; persist closed events to SQLite
         tracked = [(tid, cls) for tid, cls in raw if tid is not None]
         active  = self._tracker.update(tracked)
-        for ev in self._tracker.flush_closed():
-            database.save_violation(ev, self._session)
+        closed = self._tracker.flush_closed()
+        if closed:
+            get_db().save_violations(closed, self._session)
 
         distinct = len({ev.track_id for ev in active})
 
@@ -334,7 +339,7 @@ st.markdown("Real-time safety detection · YOLOv8 + ByteTrack · 10 Classes · C
 st.markdown("---")
 
 # Initialise shared resources
-get_db()
+repo = get_db()
 try:
     with st.spinner("Loading model…"):
         model = load_model()
@@ -448,7 +453,7 @@ elif mode == "🎞️ Video":
                         tracked = [(tid, cls) for tid, cls in raw if tid is not None]
                         active  = tracker.update(tracked)
                         for ev in tracker.flush_closed():
-                            database.save_violation(ev, session)
+                            repo.save_violation(ev, session)
                             closed_events.append(ev.to_dict())
                             log_entries.append(
                                 f'<div class="log-entry log-event">'
@@ -484,7 +489,7 @@ elif mode == "🎞️ Video":
 
                     # Flush remaining open events at end of video
                     for ev in tracker.close_all():
-                        database.save_violation(ev, session)
+                        repo.save_violation(ev, session)
                         closed_events.append(ev.to_dict())
 
                     st.success(f"✅ Done — {frame_idx} frames · {len(closed_events)} violation events logged")
@@ -492,13 +497,13 @@ elif mode == "🎞️ Video":
                     # ── Session analytics ──────────────────────────────────
                     if closed_events:
                         st.markdown("#### Violation Event Log")
-                        summary = database.get_session_summary(session)
+                        summary = repo.get_session_summary(session)
                         sa, sb, sc = st.columns(3)
                         sa.metric("Total Events",       summary.get("total_events", 0))
                         sb.metric("Distinct Violators", summary.get("distinct_violators", 0))
                         sc.metric("Violation Types",    len(summary.get("by_class", {})))
 
-                        rows = database.get_violations(session=session)
+                        rows = repo.get_violations(session=session)
                         st.dataframe(
                             rows,
                             column_order=["track_id", "violation_class", "start_time",
@@ -562,7 +567,7 @@ elif mode == "📹 Live Webcam":
             )
 
             # Pull latest events from DB for live display
-            recent = database.get_violations(limit=10)
+            recent = repo.get_violations(session=ctx.video_processor._session if ctx.video_processor else "", limit=10)
             if recent:
                 rows_html = "".join(
                     f'<div class="log-entry log-event">'
@@ -580,7 +585,7 @@ elif mode == "📹 Live Webcam":
         # ── Post-session analytics ─────────────────────────────────────────
         if ctx.video_processor:
             session = ctx.video_processor._session
-            summary = database.get_session_summary(session)
+            summary = repo.get_session_summary(session)
             if summary.get("total_events", 0) > 0:
                 st.markdown("#### Session Summary")
                 sa, sb, sc = st.columns(3)
@@ -588,7 +593,7 @@ elif mode == "📹 Live Webcam":
                 sb.metric("Distinct Violators", summary["distinct_violators"])
                 sc.metric("Violation Types",    len(summary.get("by_class", {})))
 
-                rows = database.get_violations(session=session)
+                rows = repo.get_violations(session=session)
                 st.dataframe(
                     rows,
                     column_order=["track_id", "violation_class", "start_time",

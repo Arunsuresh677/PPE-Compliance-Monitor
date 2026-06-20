@@ -1,0 +1,28 @@
+[project]
+name = "ppe-compliance-monitor"
+version = "2.0.0"
+requires-python = ">=3.10"
+description = "Real-time PPE compliance monitoring using YOLOv8 + ByteTrack"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "TCH"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]        # allow assert in tests
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+disallow_untyped_defs = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

@@ -6,6 +6,7 @@
 
 ### Real-Time Worker Safety Detection · YOLOv8 + ByteTrack · 10 Classes · Construction & Industrial
 
+[![CI](https://github.com/Arunsuresh677/PPE-Compliance-Monito/actions/workflows/ci.yml/badge.svg)](https://github.com/Arunsuresh677/PPE-Compliance-Monito/actions/workflows/ci.yml)
 [![Live Demo](https://img.shields.io/badge/🚀%20Live%20Demo-Streamlit%20Cloud-ff4b4b?style=flat-square&logo=streamlit)](https://ppe-compliance-monitor-7ssrkxc83lsifmxnfngote.streamlit.app/)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![YOLOv8](https://img.shields.io/badge/YOLOv8s-Ultralytics-FF6B35?style=flat-square)](https://ultralytics.com)
@@ -337,14 +338,70 @@ Weights are saved to `runs/ppe/exp1/weights/best.pt`.
 
 ```
 PPE-Compliance-Monito/
-├── app.py            # Streamlit web app (image / video / live webcam + tracking)
-├── detect.py         # CLI inference (webcam, video, image, RTSP + ByteTrack)
-├── tracker.py        # ViolationTracker state machine — per-ID event lifecycle
-├── database.py       # SQLite violation log (WAL mode, thread-safe)
-├── train.py          # Training script (YOLOv8, YOLO data format)
-├── requirements.txt  # Python dependencies
-├── packages.txt      # System packages (for Streamlit Cloud)
+├── app.py                        # Streamlit UI (image / video / live webcam)
+├── detect.py                     # CLI inference (video, RTSP, webcam, image)
+├── train.py                      # YOLOv8 training script
+│
+├── src/
+│   ├── config/settings.py        # Pydantic BaseSettings — all PPE_* env vars
+│   ├── detection/
+│   │   ├── model.py              # Atomic model download + YOLO loader
+│   │   └── draw.py               # Bounding box & banner annotation
+│   ├── tracking/
+│   │   └── violation_tracker.py  # Per-ID violation state machine
+│   ├── database/
+│   │   └── repository.py         # Thread-safe SQLite (WAL) persistence
+│   └── api/
+│       └── server.py             # FastAPI REST API
+│
+├── tests/
+│   ├── conftest.py               # Shared fixtures (tmp DB, mock YOLO)
+│   ├── test_tracker.py           # ViolationTracker unit tests
+│   ├── test_database.py          # ViolationRepository tests
+│   └── test_draw.py              # draw_detections tests
+│
+├── docs/
+│   └── ARCHITECTURE.md           # Design decisions & system diagram
+│
+├── .github/workflows/ci.yml      # GitHub Actions: ruff, mypy, pytest (>80% cov)
+├── docker-compose.yml            # Streamlit + API services, shared data volume
+├── pyproject.toml                # ruff, mypy, pytest config
+├── requirements.txt
 └── README.md
+```
+
+---
+
+## REST API
+
+A FastAPI service exposes violation data for dashboards, BI tools, or alert pipelines.
+
+**Run:**
+```bash
+python -m src.api.server              # default: http://localhost:8000
+PPE_API_PORT=9000 python -m src.api.server
+```
+
+**Endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Liveness check |
+| `GET` | `/api/sessions` | List all recorded sessions |
+| `GET` | `/api/violations?session=SESSION` | Violation events for a session |
+| `GET` | `/api/violations/{session}` | Same, session as path param |
+| `GET` | `/api/summary/{session}` | Aggregated stats (count, duration, by-class) |
+
+**Example:**
+```bash
+curl http://localhost:8000/api/summary/2024-06-20_09:00:00
+# {
+#   "session": "2024-06-20_09:00:00",
+#   "total_events": 14,
+#   "distinct_violators": 5,
+#   "total_violation_secs": 87.3,
+#   "by_class": {"NO-Hardhat": 9, "NO-Mask": 5}
+# }
 ```
 
 ---
