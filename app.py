@@ -17,6 +17,7 @@ from src.database.repository import ViolationRepository
 from src.tracking.violation_tracker import ViolationTracker, VIOLATION_CLASSES, COMPLIANT_CLASSES
 from src.detection.model import load_model as _load_model_impl
 from src.detection.draw import CLASS_COLORS, draw_detections
+from src.camera.manager import CameraManager
 from src.config.settings import settings
 
 log = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ def load_model() -> YOLO:
 @st.cache_resource(show_spinner=False)
 def get_db() -> ViolationRepository:
     """Initialise and return the shared ViolationRepository (once per process)."""
-    repo = ViolationRepository(db_path=DB_PATH)
+    repo = ViolationRepository()
     repo.init()
     return repo
 
@@ -247,7 +248,7 @@ with st.sidebar:
     st.markdown("---")
     conf_thresh = st.slider("Confidence Threshold", 0.10, 1.00, 0.50, 0.05)
     st.markdown("---")
-    mode = st.radio("Input Mode", ["📷 Image", "🎞️ Video", "📹 Live Webcam"])
+    mode = st.radio("Input Mode", ["📷 Image", "🎞️ Video", "📹 Live Webcam", "📡 Multi-Camera"])
     st.markdown("---")
     st.markdown("**Detection Classes**")
     for cls in CLASS_COLORS:
@@ -527,3 +528,148 @@ elif mode == "📹 Live Webcam":
                                   "end_time", "duration_secs", "frame_count"],
                     use_container_width=True,
                 )
+
+
+# ─── MULTI-CAMERA MODE ────────────────────────────────────────────────────────
+elif mode == "📡 Multi-Camera":
+    st.markdown("### 📡 Multi-Camera Fleet Monitor")
+    st.info(
+        "Monitor multiple RTSP cameras simultaneously. "
+        "Each camera runs its own YOLOv8 + ByteTrack instance. "
+        "All violations are saved to PostgreSQL with per-camera tagging."
+    )
+
+    # ── Session init ──────────────────────────────────────────────────────
+    if "mc_session" not in st.session_state:
+        st.session_state.mc_session = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+    if "mc_manager" not in st.session_state:
+        st.session_state.mc_manager = None
+    if "mc_cameras" not in st.session_state:
+        st.session_state.mc_cameras = []   # list of (camera_id, source)
+
+    session = st.session_state.mc_session
+
+    # ── Add camera form ───────────────────────────────────────────────────
+    with st.expander("➕ Add Camera", expanded=len(st.session_state.mc_cameras) == 0):
+        col_a, col_b, col_c = st.columns([1, 3, 1])
+        with col_a:
+            cam_id = st.text_input("Camera ID", placeholder="cam-01")
+        with col_b:
+            cam_src = st.text_input(
+                "Source",
+                placeholder="rtsp://192.168.1.10:554/stream  or  0  (webcam index)",
+            )
+        with col_c:
+            st.markdown("<br>", unsafe_allow_html=True)
+            add_btn = st.button("Add")
+
+        if add_btn and cam_id and cam_src:
+            source = int(cam_src) if cam_src.isdigit() else cam_src
+            existing_ids = [c[0] for c in st.session_state.mc_cameras]
+            if cam_id in existing_ids:
+                st.warning(f"Camera '{cam_id}' already added.")
+            else:
+                st.session_state.mc_cameras.append((cam_id, source))
+                st.success(f"Camera '{cam_id}' added.")
+                st.rerun()
+
+    # ── Camera list + controls ────────────────────────────────────────────
+    if st.session_state.mc_cameras:
+        st.markdown(f"**{len(st.session_state.mc_cameras)} camera(s) configured**")
+
+        remove_cols = st.columns(len(st.session_state.mc_cameras))
+        to_remove = None
+        for i, (cid, src) in enumerate(st.session_state.mc_cameras):
+            with remove_cols[i]:
+                st.caption(f"`{cid}` — `{src}`")
+                if st.button(f"✕ Remove {cid}", key=f"rm_{cid}"):
+                    to_remove = cid
+        if to_remove:
+            st.session_state.mc_cameras = [c for c in st.session_state.mc_cameras if c[0] != to_remove]
+            if st.session_state.mc_manager:
+                st.session_state.mc_manager.remove_camera(to_remove)
+            st.rerun()
+
+        st.markdown("---")
+        ctrl_col1, ctrl_col2 = st.columns(2)
+        with ctrl_col1:
+            start_btn = st.button("▶ Start All Cameras", type="primary",
+                                  disabled=st.session_state.mc_manager is not None)
+        with ctrl_col2:
+            stop_btn = st.button("⏹ Stop All Cameras",
+                                 disabled=st.session_state.mc_manager is None)
+
+        if start_btn:
+            manager = CameraManager(session=session, repo=repo, model_path=MODEL_PATH)
+            for cid, src in st.session_state.mc_cameras:
+                manager.add_camera(cid, src, conf=conf_thresh)
+            st.session_state.mc_manager = manager
+            st.rerun()
+
+        if stop_btn and st.session_state.mc_manager:
+            st.session_state.mc_manager.stop_all()
+            st.session_state.mc_manager = None
+            st.rerun()
+
+        # ── Live grid ─────────────────────────────────────────────────────
+        if st.session_state.mc_manager:
+            manager: CameraManager = st.session_state.mc_manager
+            manager.set_conf(conf_thresh)
+
+            st.markdown("#### Live Feeds")
+            cam_ids = manager.camera_ids
+            n_cols  = min(2, len(cam_ids))
+            cols    = st.columns(n_cols)
+            placeholders = {cid: cols[i % n_cols].empty() for i, cid in enumerate(cam_ids)}
+            stat_boxes   = {cid: cols[i % n_cols].empty() for i, cid in enumerate(cam_ids)}
+
+            st.markdown("---")
+            st.markdown("#### Fleet Summary")
+            fleet_cols    = st.columns(4)
+            m_cameras     = fleet_cols[0].empty()
+            m_total_viols = fleet_cols[1].empty()
+            m_total_workers = fleet_cols[2].empty()
+            m_total_fps   = fleet_cols[3].empty()
+
+            refresh_count = 0
+            while st.session_state.mc_manager is not None:
+                frames = manager.get_frames()
+                stats  = manager.get_all_stats()
+
+                total_viols   = 0
+                total_workers = 0
+                total_fps     = 0.0
+
+                for cid in cam_ids:
+                    frame = frames.get(cid)
+                    s     = stats.get(cid, {})
+
+                    if frame is not None:
+                        placeholders[cid].image(
+                            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                            use_container_width=True,
+                        )
+                    else:
+                        placeholders[cid].info(f"⏳ {cid} — {s.get('status', 'connecting...')}")
+
+                    stat_boxes[cid].markdown(
+                        f"**{cid}** · {s.get('fps', 0):.1f} FPS · "
+                        f"❌ {s.get('violations', 0)} violations · "
+                        f"👷 {s.get('distinct_violators', 0)} workers · "
+                        f"_{s.get('status', '...')}_"
+                    )
+
+                    total_viols   += s.get("violations", 0)
+                    total_workers += s.get("distinct_violators", 0)
+                    total_fps     += s.get("fps", 0.0)
+
+                m_cameras.metric("Active Cameras",    manager.count)
+                m_total_viols.metric("❌ Violations",  total_viols)
+                m_total_workers.metric("👷 Workers",   total_workers)
+                m_total_fps.metric("Avg FPS/Camera",  f"{total_fps / max(manager.count, 1):.1f}")
+
+                refresh_count += 1
+                time.sleep(0.5)
+
+    else:
+        st.info("Add at least one camera above to get started.")
